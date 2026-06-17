@@ -120,6 +120,15 @@ public sealed class ActorRuntimeTests
         Task<string> SingleArgumentWithCancellationAsync(bool arg, CancellationToken cancellationToken = default);
     }
 
+    public interface INotRemotedActorV2 : IActor
+    {
+        Task VoidReturnAsync();
+
+        Task<int> IntReturnAsync();
+
+        Task<string> StringWithIntArgAsync(int value);
+    }
+
     public sealed class NotRemotedActor : Actor, INotRemotedActor
     {
         public NotRemotedActor(ActorHost host)
@@ -145,6 +154,29 @@ public sealed class ActorRuntimeTests
         public Task<string> SingleArgumentWithCancellationAsync(bool arg, CancellationToken cancellationToken = default)
         {
             return Task.FromResult(nameof(SingleArgumentWithCancellationAsync));
+        }
+    }
+
+    public sealed class NotRemotedActorV2 : Actor, INotRemotedActorV2
+    {
+        public NotRemotedActorV2(ActorHost host)
+            : base(host)
+        {
+        }
+
+        public Task VoidReturnAsync()
+        {
+            return Task.CompletedTask;
+        }
+
+        public Task<int> IntReturnAsync()
+        {
+            return Task.FromResult(42);
+        }
+
+        public Task<string> StringWithIntArgAsync(int value)
+        {
+            return Task.FromResult($"value={value}");
         }
     }
 
@@ -581,5 +613,103 @@ public sealed class ActorRuntimeTests
                 new MemoryStream(),
                 TestContext.Current.CancellationToken);
         });
+    }
+
+    // ----- Extended DispatchWithoutRemotingAsync tests -----
+
+    [Fact]
+    public async Task NoRemotingMethod_VoidReturn()
+    {
+        var options = new ActorRuntimeOptions();
+        options.Actors.RegisterActor<NotRemotedActorV2>();
+        var runtime = new ActorRuntime(options, loggerFactory, activatorFactory, proxyFactory);
+
+        using var output = new MemoryStream();
+        await runtime.DispatchWithoutRemotingAsync(
+            nameof(NotRemotedActorV2),
+            ActorId.CreateRandom().ToString(),
+            nameof(INotRemotedActorV2.VoidReturnAsync),
+            new MemoryStream(),
+            output,
+            TestContext.Current.CancellationToken);
+
+        // Void return should produce empty output
+        Assert.Equal(0, output.Length);
+    }
+
+    [Fact]
+    public async Task NoRemotingMethod_IntReturn()
+    {
+        var options = new ActorRuntimeOptions();
+        options.Actors.RegisterActor<NotRemotedActorV2>();
+        var runtime = new ActorRuntime(options, loggerFactory, activatorFactory, proxyFactory);
+
+        using var output = new MemoryStream();
+        await runtime.DispatchWithoutRemotingAsync(
+            nameof(NotRemotedActorV2),
+            ActorId.CreateRandom().ToString(),
+            nameof(INotRemotedActorV2.IntReturnAsync),
+            new MemoryStream(),
+            output,
+            TestContext.Current.CancellationToken);
+
+        output.Seek(0, SeekOrigin.Begin);
+        var result = JsonSerializer.Deserialize<int>(output);
+        Assert.Equal(42, result);
+    }
+
+    [Fact]
+    public async Task NoRemotingMethod_SingleIntArgument()
+    {
+        var options = new ActorRuntimeOptions();
+        options.Actors.RegisterActor<NotRemotedActorV2>();
+        var runtime = new ActorRuntime(options, loggerFactory, activatorFactory, proxyFactory);
+
+        using var input = new MemoryStream();
+        JsonSerializer.Serialize(input, 7);
+        input.Seek(0, SeekOrigin.Begin);
+
+        using var output = new MemoryStream();
+        await runtime.DispatchWithoutRemotingAsync(
+            nameof(NotRemotedActorV2),
+            ActorId.CreateRandom().ToString(),
+            nameof(INotRemotedActorV2.StringWithIntArgAsync),
+            input,
+            output,
+            TestContext.Current.CancellationToken);
+
+        output.Seek(0, SeekOrigin.Begin);
+        var result = JsonSerializer.Deserialize<string>(output);
+        Assert.Equal("value=7", result);
+    }
+
+    [Fact]
+    public async Task NoRemotingMethod_CanCallSameMethodTwice()
+    {
+        var options = new ActorRuntimeOptions();
+        options.Actors.RegisterActor<NotRemotedActor>();
+        var runtime = new ActorRuntime(options, loggerFactory, activatorFactory, proxyFactory);
+
+        var actorId = ActorId.CreateRandom().ToString();
+
+        // First call
+        using var output1 = new MemoryStream();
+        await runtime.DispatchWithoutRemotingAsync(
+            nameof(NotRemotedActor), actorId,
+            nameof(INotRemotedActor.NoArgumentsAsync),
+            new MemoryStream(), output1, TestContext.Current.CancellationToken);
+        output1.Seek(0, SeekOrigin.Begin);
+        var result1 = JsonSerializer.Deserialize<string>(output1);
+        Assert.Equal(nameof(INotRemotedActor.NoArgumentsAsync), result1);
+
+        // Second call with same actorId — executor should be reused from cache
+        using var output2 = new MemoryStream();
+        await runtime.DispatchWithoutRemotingAsync(
+            nameof(NotRemotedActor), actorId,
+            nameof(INotRemotedActor.NoArgumentsAsync),
+            new MemoryStream(), output2, TestContext.Current.CancellationToken);
+        output2.Seek(0, SeekOrigin.Begin);
+        var result2 = JsonSerializer.Deserialize<string>(output2);
+        Assert.Equal(nameof(INotRemotedActor.NoArgumentsAsync), result2);
     }
 }

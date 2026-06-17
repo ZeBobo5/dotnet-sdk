@@ -16,6 +16,7 @@ namespace Dapr.Actors.Runtime;
 using System;
 using System.Collections.Concurrent;
 using System.IO;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -23,6 +24,7 @@ using System.Threading.Tasks;
 using Dapr.Actors;
 using Dapr.Actors.Client;
 using Dapr.Actors.Communication;
+using Dapr.Actors.Internal;
 using Microsoft.Extensions.Logging;
 
 // The ActorManager serves as a cache for a variety of different concerns related to an Actor type
@@ -46,8 +48,11 @@ internal sealed class ActorManager
     // method dispatchermap used by remoting calls.
     private readonly ActorMethodDispatcherMap methodDispatcherMap;
 
-    // method info map used by non-remoting calls.
-    private readonly ActorMethodInfoMap actorMethodInfoMap;
+    // method executor map used by non-remoting calls.
+    private readonly ActorMethodExecutorMap actorMethodExecutorMap;
+
+    // cached executors for timer callbacks, keyed by callback method name.
+    private readonly ConcurrentDictionary<string, ObjectMethodExecutor> timerCallbackExecutors;
 
     private readonly ILogger logger;
     private IDaprInteractor daprInteractor { get; }
@@ -75,7 +80,8 @@ internal sealed class ActorManager
         this.methodDispatcherMap = new ActorMethodDispatcherMap(this.registration.Type.InterfaceTypes);
 
         // map for non-remoting calls.
-        this.actorMethodInfoMap = new ActorMethodInfoMap(this.registration.Type.InterfaceTypes);
+        this.actorMethodExecutorMap = new ActorMethodExecutorMap(this.registration.Type.InterfaceTypes);
+        this.timerCallbackExecutors = new ConcurrentDictionary<string, ObjectMethodExecutor>();
         this.activeActors = new ConcurrentDictionary<ActorId, ActorActivatorState>();
         this.reminderMethodContext = ActorMethodContext.CreateForReminder(ReceiveReminderMethodName);
         this.timerMethodContext = ActorMethodContext.CreateForTimer(TimerMethodName);
@@ -141,42 +147,52 @@ internal sealed class ActorManager
         var actorMethodContext = ActorMethodContext.CreateForActor(actorMethodName);
 
         // Create a Func to be invoked by common method.
-        var methodInfo = this.actorMethodInfoMap.LookupActorMethodInfo(actorMethodName);
+        var executor = this.actorMethodExecutorMap.LookupActorMethodExecutor(actorMethodName);
 
         async Task<object> RequestFunc(Actor actor, CancellationToken ct)
         {
-            var parameters = methodInfo.GetParameters();
-            dynamic awaitable;
+            var parameters = executor.MethodParameters;
+            object[] args;
 
-            if (parameters.Length == 0 || (parameters.Length == 1 && parameters[0].ParameterType == typeof(CancellationToken)))
+            if (parameters.Length == 0)
             {
-                awaitable = methodInfo.Invoke(actor, parameters.Length == 0 ? null : new object[] { ct });
+                args = null;
+            }
+            else if (parameters.Length == 1 && parameters[0].ParameterType == typeof(CancellationToken))
+            {
+                args = new object[] { ct };
             }
             else if (parameters.Length == 1 || (parameters.Length == 2 && parameters[1].ParameterType == typeof(CancellationToken)))
             {
                 // deserialize using stream.
                 var type = parameters[0].ParameterType;
                 var deserializedType = await JsonSerializer.DeserializeAsync(requestBodyStream, type, jsonSerializerOptions);
-                awaitable = methodInfo.Invoke(actor, parameters.Length == 1 ? new object[] { deserializedType } : new object[] { deserializedType, ct });
+                args = parameters.Length == 1 ? new object[] { deserializedType } : new object[] { deserializedType, ct };
             }
             else
             {
-                var errorMsg = $"Method {string.Concat(methodInfo.DeclaringType.Name, ".", methodInfo.Name)} has more than one parameter and can't be invoked through http";
+                var errorMsg = $"Method {string.Concat(executor.MethodInfo.DeclaringType.Name, ".", executor.MethodInfo.Name)} has more than one parameter and can't be invoked through http";
                 throw new ArgumentException(errorMsg);
             }
 
-            await awaitable;
-
-            // Handle the return type of method correctly.
-            if (methodInfo.ReturnType.Name != typeof(Task).Name)
+            if (executor.IsMethodAsync)
             {
-                // already await, Getting result will be non blocking.
-                var x = awaitable.GetAwaiter().GetResult();
-                return x;
+                var awaitable = executor.ExecuteAsync(actor, args);
+                await awaitable;
+
+                if (executor.AsyncResultType != null && executor.AsyncResultType != typeof(void))
+                {
+                    var resultValue = awaitable.GetAwaiter().GetResult();
+                    return resultValue;
+                }
+                else
+                {
+                    return default;
+                }
             }
             else
             {
-                return default;
+                return executor.Execute(actor, args);
             }
         }
 
@@ -184,11 +200,10 @@ internal sealed class ActorManager
 
         // Write Response back if method's return type is other than Task.
         // Serialize result if it has result (return type was not just Task.)
-        if (methodInfo.ReturnType.Name != typeof(Task).Name)
+        if (executor.AsyncResultType != null && executor.AsyncResultType != typeof(void))
         {
 #if NET7_0_OR_GREATER
-            var resultType = methodInfo.ReturnType.GenericTypeArguments[0];
-            await JsonSerializer.SerializeAsync(responseBodyStream, result, resultType, jsonSerializerOptions);
+            await JsonSerializer.SerializeAsync(responseBodyStream, result, executor.AsyncResultType, jsonSerializerOptions);
 #else
                 await JsonSerializer.SerializeAsync<object>(responseBodyStream, result, jsonSerializerOptions); 
 #endif
@@ -229,23 +244,25 @@ internal sealed class ActorManager
         // Create a Func to be invoked by common method.
         async Task<bool> RequestFunc(Actor actor, CancellationToken ct)
         {
-            var actorType = actor.Host.ActorTypeInfo.ImplementationType;
-            var methodInfo = actor.GetMethodInfoUsingReflection(actorType, timerData.Callback);
-
-            var parameters = methodInfo.GetParameters();
-            var args = (parameters.Length == 0) ? null : new object[] { timerData.Data };
-            
-            var result = methodInfo.Invoke(actor, args);
-
-            switch (result)
+            var executor = this.timerCallbackExecutors.GetOrAdd(timerData.Callback, name =>
             {
-                case Task<bool> boolTask:
-                    return await boolTask;
-                case Task task:
-                    await task;
-                    return false;
-                default:
-                    return false;
+                var actorType = actor.Host.ActorTypeInfo.ImplementationType;
+                var methodInfo = actor.GetMethodInfoUsingReflection(actorType, name);
+                return ObjectMethodExecutor.Create(methodInfo, actorType.GetTypeInfo());
+            });
+
+            var args = executor.MethodParameters.Length == 0 ? null : new object[] { timerData.Data };
+
+            var awaitable = executor.ExecuteAsync(actor, args);
+            await awaitable;
+
+            if (executor.AsyncResultType == typeof(bool))
+            {
+                return (bool)awaitable.GetAwaiter().GetResult();
+            }
+            else
+            {
+                return false;
             }
         }
         

@@ -330,6 +330,120 @@ public sealed class ActorManagerTests
         Assert.Equal(TimeSpan.Zero, result.Period);
         Assert.Equal(TimeSpan.FromSeconds(7).Add(TimeSpan.FromMilliseconds(10)), result.Ttl);
     }
+
+    // ----- FireTimerAsync integration tests -----
+
+    private interface ITimerTestActor : IActor { }
+
+    private class TimerTestActor : Actor, ITimerTestActor
+    {
+        public bool TimerCallbackInvoked { get; set; }
+        public byte[] LastTimerData { get; set; }
+        public int CallbackCount { get; set; }
+
+        public TimerTestActor(ActorHost host) : base(host)
+        {
+        }
+
+        public Task TimerCallbackNoArgs()
+        {
+            TimerCallbackInvoked = true;
+            CallbackCount++;
+            return Task.CompletedTask;
+        }
+
+        public Task TimerCallbackWithData(byte[] data)
+        {
+            TimerCallbackInvoked = true;
+            LastTimerData = data;
+            CallbackCount++;
+            return Task.CompletedTask;
+        }
+
+        public async Task TimerCallbackAsync(byte[] data)
+        {
+            await Task.Delay(1);
+            TimerCallbackInvoked = true;
+            LastTimerData = data;
+            CallbackCount++;
+        }
+    }
+
+    [Fact]
+    public async Task FireTimerAsync_InvokesCallbackWithNoArgs()
+    {
+        var manager = CreateActorManager(typeof(TimerTestActor));
+        var id = ActorId.CreateRandom();
+        await manager.ActivateActorAsync(id);
+
+        var timerJson = "{\"callback\": \"TimerCallbackNoArgs\", \"period\": \"@every 1s\"}";
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(timerJson));
+        await manager.FireTimerAsync(id, stream, TestContext.Current.CancellationToken);
+
+        Assert.True(manager.TryGetActorAsync(id, out var actor));
+        var timerActor = (TimerTestActor)actor;
+        Assert.True(timerActor.TimerCallbackInvoked);
+        Assert.Equal(1, timerActor.CallbackCount);
+    }
+
+    [Fact]
+    public async Task FireTimerAsync_InvokesCallbackWithData()
+    {
+        var manager = CreateActorManager(typeof(TimerTestActor));
+        var id = ActorId.CreateRandom();
+        await manager.ActivateActorAsync(id);
+
+        var data = new byte[] { 1, 2, 3 };
+        var dataBase64 = Convert.ToBase64String(data);
+        var timerJson = $"{{\"callback\": \"TimerCallbackWithData\", \"period\": \"@every 1s\", \"data\": \"{dataBase64}\"}}";
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(timerJson));
+        await manager.FireTimerAsync(id, stream, TestContext.Current.CancellationToken);
+
+        Assert.True(manager.TryGetActorAsync(id, out var actor));
+        var timerActor = (TimerTestActor)actor;
+        Assert.True(timerActor.TimerCallbackInvoked);
+        Assert.Equal(data, timerActor.LastTimerData);
+    }
+
+    [Fact]
+    public async Task FireTimerAsync_CachesExecutorsAcrossFires()
+    {
+        var manager = CreateActorManager(typeof(TimerTestActor));
+        var id = ActorId.CreateRandom();
+        await manager.ActivateActorAsync(id);
+
+        var timerJson = "{\"callback\": \"TimerCallbackNoArgs\", \"period\": \"@every 1s\"}";
+
+        // Fire twice
+        using var stream1 = new MemoryStream(Encoding.UTF8.GetBytes(timerJson));
+        await manager.FireTimerAsync(id, stream1, TestContext.Current.CancellationToken);
+
+        using var stream2 = new MemoryStream(Encoding.UTF8.GetBytes(timerJson));
+        await manager.FireTimerAsync(id, stream2, TestContext.Current.CancellationToken);
+
+        Assert.True(manager.TryGetActorAsync(id, out var actor));
+        var timerActor = (TimerTestActor)actor;
+        Assert.Equal(2, timerActor.CallbackCount);
+    }
+
+    [Fact]
+    public async Task FireTimerAsync_InvokesAsyncCallback()
+    {
+        var manager = CreateActorManager(typeof(TimerTestActor));
+        var id = ActorId.CreateRandom();
+        await manager.ActivateActorAsync(id);
+
+        var data = new byte[] { 4, 5, 6 };
+        var dataBase64 = Convert.ToBase64String(data);
+        var timerJson = $"{{\"callback\": \"TimerCallbackAsync\", \"period\": \"@every 1s\", \"data\": \"{dataBase64}\"}}";
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(timerJson));
+        await manager.FireTimerAsync(id, stream, TestContext.Current.CancellationToken);
+
+        Assert.True(manager.TryGetActorAsync(id, out var actor));
+        var timerActor = (TimerTestActor)actor;
+        Assert.True(timerActor.TimerCallbackInvoked);
+        Assert.Equal(data, timerActor.LastTimerData);
+    }
     
     private interface ITestActor : IActor { }
         

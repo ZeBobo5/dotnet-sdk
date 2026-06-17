@@ -16,35 +16,37 @@ namespace Dapr.Actors.Runtime;
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using Dapr.Actors.Internal;
 
 /// <summary>
-/// Actor method dispatcher map for non remoting calls. method_name -> MethodInfo for methods defined in IACtor interfaces.
+/// Actor method executor map for non-remoting calls. method_name -> ObjectMethodExecutor for methods defined in IActor interfaces.
 /// </summary>
-internal class ActorMethodInfoMap
+internal class ActorMethodExecutorMap
 {
-    private readonly Dictionary<string, MethodInfo> methods;
+    private readonly Dictionary<string, ObjectMethodExecutor> executors;
 
-    public ActorMethodInfoMap(IEnumerable<Type> interfaceTypes)
+    public ActorMethodExecutorMap(IEnumerable<Type> interfaceTypes)
     {
-        this.methods = new Dictionary<string, MethodInfo>();
+        this.executors = new Dictionary<string, ObjectMethodExecutor>();
 
-        // Find methods which are defined in IActor interface.
         foreach (var actorInterface in interfaceTypes)
         {
+            var targetTypeInfo = actorInterface.GetTypeInfo();
             foreach (var methodInfo in actorInterface.GetMethods())
             {
-                this.methods.Add(methodInfo.Name, methodInfo);
+                var executor = ObjectMethodExecutor.Create(methodInfo, targetTypeInfo);
+                this.executors.Add(methodInfo.Name, executor);
             }
         }
     }
 
-    public MethodInfo LookupActorMethodInfo(string methodName)
+    public ObjectMethodExecutor LookupActorMethodExecutor(string methodName)
     {
-        if (!this.methods.TryGetValue(methodName, out var methodInfo))
+        if (!this.executors.TryGetValue(methodName, out var executor))
         {
             throw new MissingMethodException($"Actor type doesn't contain method {methodName}");
         }
 
-        return methodInfo;
+        return executor;
     }
 }
